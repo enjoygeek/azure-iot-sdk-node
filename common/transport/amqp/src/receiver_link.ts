@@ -7,9 +7,9 @@ import { AmqpMessage } from './amqp_message';
 import { AmqpLink } from './amqp_link_interface';
 import { AmqpTransportError } from './amqp_common_errors';
 
-const debug = dbg('AmqpReceiverLinkFsm');
+const debug = dbg('ReceiverLink');
 
-export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
+export class ReceiverLink  extends EventEmitter implements AmqpLink {
   private _linkAddress: string;
   private _linkOptions: any;
   private _linkObject: any;
@@ -20,7 +20,6 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
     settleMethod: string,
     callback: (err?: Error, result?: results.MessageEnqueued) => void
   }[];
-  private _attachCallback: (err?: Error) => void;
   private _detachHandler: (detachEvent: any) => void;
   private _errorHandler: (err: Error) => void;
   private _messageHandler: (message: AmqpMessage) => void;
@@ -33,15 +32,11 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
     this._messageQueue = [];
 
     this._detachHandler = (detachEvent: any): void => {
-      this._linkObject = null;
-      if (detachEvent.error) {
-        this.emit('error', detachEvent.error);
-      }
-      this._fsm.transition('detached');
+      this._fsm.transition('detaching', detachEvent.error);
     };
 
     this._errorHandler = (err: Error): void => {
-      this.emit('errorReceived', err);
+      this._fsm.transition('detaching', err);
     };
 
     this._messageHandler = (message: AmqpMessage): void => {
@@ -60,21 +55,21 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
       initialState: 'detached',
       states: {
         detached: {
-          _onEnter: () => {
+          _onEnter: (err) => {
             let toSettle = this._messageQueue.shift();
             while (toSettle) {
-              // TODO need a custom error for the client to handle
-              toSettle.callback(new Error('link is being detached'));
+              toSettle.callback(err || new Error('Link was detached'));
               toSettle = this._messageQueue.shift();
+            }
+
+            if (err) {
+              this.emit('error', err);
             }
           },
           attach: (callback) => {
-            this._attachCallback = callback;
-            this._fsm.transition('attaching');
+            this._fsm.transition('attaching', callback);
           },
-          detach: (callback) => {
-            if (callback) callback();
-          },
+          detach: () => { return; },
           accept: (message, callback) => {
             pushToQueue('accept', message, callback);
             this._fsm.transition('attaching');
@@ -89,49 +84,36 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
           }
         },
         attaching: {
-          _onEnter: () => {
+          _onEnter: (callback) => {
             this._attachLink((err) => {
               let newState = err ? 'detached' : 'attached';
-              this._fsm.transition(newState);
-              if (this._attachCallback) {
-                let cb = this._attachCallback;
-                this._attachCallback = null;
-                cb(err);
+              if (callback) {
+                this._fsm.transition(newState);
+                callback(err);
+              } else {
+                this._fsm.transition(newState, err);
               }
             });
           },
-          detach: () => {
-            this._fsm.transition('detaching');
-            this._detachLink();
-            this._fsm.transition('detached');
-          },
+          detach: () => this._fsm.transition('detaching'),
           accept: (message, callback) => pushToQueue('accept', message, callback),
           reject: (message, callback) => pushToQueue('reject', message, callback),
           abandon: (message, callback) => pushToQueue('abandon', message, callback)
         },
         attached: {
           _onEnter: () => {
-            this._linkObject.on('detached', this._detachHandler);
-            this._linkObject.on('errorReceived', this._errorHandler);
-            this._linkObject.on('message', this._messageHandler);
-
             let toSettle = this._messageQueue.shift();
             while (toSettle) {
               this._fsm.handle(toSettle.settleMethod, toSettle.message, toSettle.callback);
               toSettle = this._messageQueue.shift();
             }
           },
-          _onExit: () => {
-            this._linkObject.removeListener('detached', this._detachHandler);
-            this._linkObject.removeListener('message', this._messageHandler);
-            this._linkObject.removeListener('errorReceived', this._errorHandler);
+          attach: (callback) => {
+            if (callback) {
+              return callback()
+            }
           },
-          attach: (callback) => callback(),
-          detach: () => {
-            this._fsm.transition('detaching');
-            this._detachLink();
-            this._fsm.transition('detached');
-          },
+          detach: () => this._fsm.transition('detaching'),
           accept: (message, callback) => {
             this._linkObject.accept(message);
             if (callback) callback(null, new results.MessageCompleted());
@@ -146,14 +128,25 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
           }
         },
         detaching: {
+          _onEnter: (err) => {
+            if (this._linkObject) {
+              this._linkObject.removeListener('detached', this._detachHandler);
+              this._linkObject.removeListener('message', this._messageHandler);
+              this._linkObject.removeListener('errorReceived', this._errorHandler);
+              this._linkObject.forceDetach();
+              this._linkObject = null;
+            }
+
+            this._fsm.transition('detached', err);
+          },
           '*': () => this._fsm.deferUntilTransition('detached')
         }
       }
     });
 
-    this.on('removeListener', () => {
+    this.on('removeListener', (eventName) => {
       // stop listening for AMQP events if our consumers stop listening for our events
-      if (this.listeners('message').length === 0) {
+      if (eventName === 'message' && this.listeners('message').length === 0) {
         this._fsm.handle('detach');
       }
     });
@@ -161,12 +154,7 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
     this.on('newListener', (eventName) => {
       // lazy-init AMQP event listeners
       if (eventName === 'message') {
-        this._fsm.handle('attach', (err) => {
-          if (err) {
-            // TODO clean up between errorReceived and error events.
-            this.emit('error', err);
-          }
-        });
+        this._fsm.handle('attach');
       }
     });
   }
@@ -190,12 +178,12 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
 
   reject(message: Message, callback?: (err?: Error, result?: results.MessageRejected) => void): void {
     if (!message) { throw new ReferenceError('Invalid message object.'); }
-    this._fsm.handle('reject', message, callback);
+    this._fsm.handle('reject', message.transportObj, callback);
   }
 
   abandon(message: Message, callback?: (err?: Error, result?: results.MessageAbandoned) => void): void {
     if (!message) { throw new ReferenceError('Invalid message object.'); }
-    this._fsm.handle('abandon', message, callback);
+    this._fsm.handle('abandon', message.transportObj, callback);
   }
 
   private _attachLink(done: (err?: Error) => void): void {
@@ -218,6 +206,9 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
         if (!connectionError) {
           debug('Receiver object created for endpoint: ' + this._linkAddress);
           this._linkObject = amqp10link;
+          this._linkObject.on('detached', this._detachHandler);
+          this._linkObject.on('errorReceived', this._errorHandler);
+          this._linkObject.on('message', this._messageHandler);
           /*Codes_SRS_NODE_COMMON_AMQP_16_020: [The `attachReceiverLink` method shall call the `done` callback with a `null` error and the link object that was created if the link was attached successfully.]*/
           this._safeCallback(done);
         } else {
@@ -228,16 +219,9 @@ export class AmqpReceiverLinkFsm  extends EventEmitter implements AmqpLink {
         return null;
       })
       .catch((err) => {
-        let error: AmqpTransportError = new errors.NotConnectedError('AMQP: Could not create receiver');
-        error.amqpError = err;
         /*Codes_SRS_NODE_COMMON_AMQP_16_021: [The `attachReceiverLink` method shall call the `done` callback with an `Error` object if the link object wasn't created successfully.]*/
-        this._safeCallback(done, error);
+        this._safeCallback(done, err);
       });
-  }
-
-  private _detachLink(): void {
-    this._linkObject.forceDetach();
-    this._linkObject = null;
   }
 
   /*Codes_SRS_NODE_COMMON_AMQP_16_011: [All methods should treat the `done` callback argument as optional and not throw if it is not passed as argument.]*/

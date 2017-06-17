@@ -6,7 +6,7 @@ import * as uuid from 'uuid';
 import { errors } from 'azure-iot-common';
 import { AmqpMessage } from './amqp_message';
 import { SenderLink } from './sender_link';
-import { AmqpReceiverLinkFsm } from './amqp_receiver_link_fsm';
+import { ReceiverLink } from './receiver_link';
 
 /**
  * @class      module:azure-iot-amqp-base.PutTokenOperation
@@ -56,14 +56,14 @@ export class ClaimsBasedSecurityAgent extends EventEmitter {
   private _fsm: machina.Fsm;
   private _attachCallback: (err?: Error) => void;
   private _senderLink: SenderLink;
-  private _receiverLink: AmqpReceiverLinkFsm;
+  private _receiverLink: ReceiverLink;
   private _putToken: PutTokenStatus = new PutTokenStatus();
 
   constructor(amqp10Client: amqp10.AmqpClient) {
     super();
     this._amqp10Client = amqp10Client;
     this._senderLink = new SenderLink(ClaimsBasedSecurityAgent._putTokenSendingEndpoint, { encoder: (body) => body }, this._amqp10Client);
-    this._receiverLink = new AmqpReceiverLinkFsm(ClaimsBasedSecurityAgent._putTokenReceivingEndpoint, null, this._amqp10Client);
+    this._receiverLink = new ReceiverLink(ClaimsBasedSecurityAgent._putTokenReceivingEndpoint, null, this._amqp10Client);
     this._fsm = new machina.Fsm({
       initialState: 'detached',
       states: {

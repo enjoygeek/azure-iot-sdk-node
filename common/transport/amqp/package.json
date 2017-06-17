@@ -9,7 +9,6 @@
   "dependencies": {
     "amqp10": "3.5.0",
     "amqp10-transport-ws": "^0.0.5",
-    "azure-iot-common": "1.1.8",
     "bluebird": "^3.5.0",
     "debug": "^2.6.0",
     "machina": "^2.0.0",
@@ -22,10 +21,8 @@
     "jshint": "^2.9.4",
     "mocha": "^3.2.0",
     "sinon": "^2.3.4",
-    "sinon-as-promised": "^4.0.2",
     "tslint": "^5.1.0",
-    "typescript": "2.2.2",
-    "uuid": "^3.0.1"
+    "typescript": "2.2.2"
   },
   "scripts": {
     "lint": "tslint --type-check --project . -c ../../../tslint.json",

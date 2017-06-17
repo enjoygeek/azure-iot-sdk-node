@@ -2,10 +2,9 @@ import * as machina from 'machina';
 import * as amqp10 from 'amqp10';
 import * as dbg from 'debug';
 import { EventEmitter } from 'events';
-import { Message, results, errors } from 'azure-iot-common';
+import { Message, results } from 'azure-iot-common';
 import { AmqpMessage } from './amqp_message';
 import { AmqpLink } from './amqp_link_interface';
-import { AmqpTransportError } from './amqp_common_errors';
 
 const debug = dbg('SenderLink');
 
@@ -32,13 +31,11 @@ export class SenderLink extends EventEmitter implements AmqpLink {
     this._messageQueue = [];
 
     this._detachHandler = (detachEvent: any): void => {
-      this._fsm.transition('detaching');
-      this._linkObject = null;
-      this._fsm.transition('detached');
+      this._fsm.transition('detaching', detachEvent.error);
     };
 
     this._errorHandler = (err: Error): void => {
-      this.emit('error', err);
+      this._fsm.transition('detaching', err);
     };
 
     const pushToQueue = (message, callback) => {
@@ -52,7 +49,7 @@ export class SenderLink extends EventEmitter implements AmqpLink {
       initialState: 'detached',
       states: {
         detached: {
-          _onEnter: () => {
+          _onEnter: (err) => {
             if (this._messageQueue.length > 0) {
               let messageCallbackError = this._attachError || new Error('Link Detached'); // Do we need a better custom error here?
 
@@ -62,35 +59,32 @@ export class SenderLink extends EventEmitter implements AmqpLink {
                 toSend = this._messageQueue.shift();
               }
             }
+
+            if (err) {
+              this.emit('error', err);
+            }
           },
           attach: (callback) => {
-            this._attachCallback = callback;
-            this._fsm.transition('attaching');
+            this._fsm.transition('attaching', callback);
           },
-          detach: () => {},
+          detach: () => { return; },
           send: (message, callback) => {
             pushToQueue(message, callback);
             this._fsm.handle('attach');
           }
         },
         attaching: {
-          _onEnter: () => {
+          _onEnter: (callback) => {
             this._attachLink((err) => {
               let newState = err ? 'detached' : 'attached';
               this._attachError = err;
-              this._fsm.transition(newState);
-              if (this._attachCallback) {
-                let cb = this._attachCallback;
-                this._attachCallback = null;
-                cb(err);
+              this._fsm.transition(newState, err);
+              if (callback) {
+                callback(err);
               }
             });
           },
-          detach: () => {
-            this._fsm.transition('detaching');
-            this._detachLink();
-            this._fsm.transition('detached');
-          },
+          detach: () => this._fsm.transition('detaching'),
           send: (message, callback) => pushToQueue(message, callback)
         },
         attached: {
@@ -104,19 +98,19 @@ export class SenderLink extends EventEmitter implements AmqpLink {
           _onExit: () => {
             this._linkObject.removeListener('detached', this._detachHandler);
           },
-          attach: (callback) => callback(),
-          detach: () => {
-            this._fsm.transition('detaching');
-            this._detachLink();
-            this._fsm.transition('detached');
+          attach: (callback) => {
+            if (callback) {
+              callback();
+            }
           },
+          detach: () => this._fsm.transition('detaching'),
           send: (message, callback) => {
             /*Codes_SRS_NODE_COMMON_AMQP_16_011: [All methods should treat the `done` callback argument as optional and not throw if it is not passed as argument.]*/
             let _safeCallback = (callback, error?, result?) => {
               if (callback) {
                 process.nextTick(() => callback(error, result));
               }
-            }
+            };
             this._linkObject.send(message)
                             .then((state) => {
                               _safeCallback(callback, null, new results.MessageEnqueued(state));
@@ -129,6 +123,13 @@ export class SenderLink extends EventEmitter implements AmqpLink {
           }
         },
         detaching: {
+          _onEnter: (err) => {
+            if (this._linkObject) {
+              this._linkObject.forceDetach();
+              this._linkObject = null;
+            }
+            this._fsm.transition('detached', err);
+          },
           '*': () => this._fsm.deferUntilTransition('detached')
         }
       }
@@ -174,10 +175,5 @@ export class SenderLink extends EventEmitter implements AmqpLink {
         return callback(connectionError);
       })
       .catch((err) => callback(err));
-  }
-
-  private _detachLink(): void {
-    this._linkObject.forceDetach();
-    this._linkObject = null;
   }
 }

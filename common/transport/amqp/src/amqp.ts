@@ -9,7 +9,7 @@ import { AmqpMessage } from './amqp_message';
 import { results, Message } from 'azure-iot-common';
 import { ClaimsBasedSecurityAgent } from './amqp_cbs';
 import { SenderLink } from './sender_link';
-import { AmqpReceiverLinkFsm } from './amqp_receiver_link_fsm';
+import { ReceiverLink } from './receiver_link';
 import { AmqpLink } from './amqp_link_interface';
 
 import * as dbg from 'debug';
@@ -31,7 +31,7 @@ export type GenericAmqpBaseCallback = (err: Error | null, result?: any) => void;
 export class Amqp {
   private uri: string;
   private _amqp: amqp10.Client;
-  private _receivers: { [key: string]: AmqpReceiverLinkFsm; } = {};
+  private _receivers: { [key: string]: ReceiverLink; } = {};
   private _senders: { [key: string]: SenderLink; } = {};
   private _disconnectHandler: (err: Error) => void;
   private _fsm: machina.Fsm;
@@ -162,10 +162,13 @@ export class Amqp {
             }
 
             if (!this._senders[endpoint]) {
-              this._senders[endpoint] = new SenderLink(endpoint, null, this._amqp);
+              this._fsm.handle('attachSenderLink', function(err) {
+                (this._senders[endpoint] as SenderLink).send(amqpMessage, done);
+              });
+            } else {
+              (this._senders[endpoint] as SenderLink).send(amqpMessage, done);
             }
 
-            (this._senders[endpoint] as SenderLink).send(amqpMessage, done);
           },
           getReceiver: (endpoint: string, done: GenericAmqpBaseCallback): void => {
             /*Codes_SRS_NODE_COMMON_AMQP_16_010: [If a receiver for this endpoint doesn’t exist, the getReceiver method should create a new AmqpReceiver object and then call the done() method with the object that was just created as an argument.] */
@@ -183,13 +186,23 @@ export class Amqp {
             }
           },
           attachReceiverLink: (endpoint: string, linkOptions: any, done: GenericAmqpBaseCallback): void => {
-            let receiverFsm = new AmqpReceiverLinkFsm(endpoint, linkOptions, this._amqp);
+            let receiverFsm = new ReceiverLink(endpoint, linkOptions, this._amqp);
             this._receivers[endpoint] = receiverFsm;
+            this._receivers[endpoint].on('error', (err) => {
+              debug('error on the receiver link for endpoint ' + endpoint);
+              debug(err.toString());
+              delete(this._receivers[endpoint]);
+            });
             this._receivers[endpoint].attach(done);
           },
           attachSenderLink: (endpoint: string, linkOptions: any, done: GenericAmqpBaseCallback): void => {
             let senderFsm = new SenderLink(endpoint, linkOptions, this._amqp);
             this._senders[endpoint] = senderFsm;
+            this._senders[endpoint].on('error', (err) => {
+              debug('error on the sender link for endpoint ' + endpoint);
+              debug(err.toString());
+              delete(this._senders[endpoint]);
+            });
             this._senders[endpoint].attach(done);
           },
           detachReceiverLink: (endpoint: string, detachCallback: GenericAmqpBaseCallback): void => {
@@ -277,10 +290,11 @@ export class Amqp {
       }
     }
     this._receivers = {};
+
     /*Codes_SRS_NODE_COMMON_AMQP_16_004: [The disconnect method shall call the done callback when the application/service has been successfully disconnected from the service] */
-    if (done) {
-      done(null, new results.Disconnected());
-    }
+    this._amqp.disconnect()
+              .then(() => this._safeCallback(done, null, new results.Disconnected()))
+              .catch((err) => this._safeCallback(done, err));
   }
 
   /**
